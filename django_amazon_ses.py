@@ -1,4 +1,6 @@
 """Boto3 email backend class for Amazon SES."""
+from datetime import datetime, timedelta, timezone
+
 import boto3
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -46,6 +48,10 @@ class EmailBackend(BaseEmailBackend):
             settings, "AWS_SES_SECRET_ACCESS_KEY", secret_access_key
         )
         region_name = getattr(settings, "AWS_SES_REGION", region_name)
+        self.assume_role_arn = getattr(settings, "AWS_SES_ASSUME_ROLE_ARN", None)
+        self.assume_region_name = getattr(
+            settings, "AWS_SES_ASSUME_REGION", "us-east-1"
+        )
         self.configuration_set_name = getattr(
             settings, "AWS_SES_CONFIGURATION_SET_NAME", None
         )
@@ -57,12 +63,22 @@ class EmailBackend(BaseEmailBackend):
             access_key_id = aws_access_key_id
             secret_access_key = aws_secret_access_key
 
-        self.conn = boto3.client(
-            "ses",
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-            region_name=region_name,
-        )
+        if self.assume_role_arn:
+            self.sts_conn = boto3.client(
+                "sts",
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name=region_name,
+            )
+
+            self.conn = None
+        else:
+            self.conn = boto3.client(
+                "ses",
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name=region_name,
+            )
 
     def send_messages(self, email_messages):
         """Sends one or more EmailMessage objects and returns the
@@ -110,6 +126,25 @@ class EmailBackend(BaseEmailBackend):
         message = email_message.message().as_bytes(linesep="\r\n")
 
         try:
+            if self.assume_role_arn and (
+                not self.conn
+                or self.expiration - timedelta(minutes=5) <= datetime.now(timezone.utc)
+            ):
+                result = self.sts_conn.assume_role(
+                    RoleArn=self.assume_role_arn,
+                    RoleSessionName="django_amazon_ses",
+                )
+                credentials = result["Credentials"]
+                self.expiration = credentials["Expiration"]
+
+                self.conn = boto3.client(
+                    "ses",
+                    aws_access_key_id=credentials["AccessKeyId"],
+                    aws_secret_access_key=credentials["SecretAccessKey"],
+                    aws_session_token=credentials["SessionToken"],
+                    region_name=self.assume_region_name,
+                )
+
             kwargs = {
                 "Source": from_email,
                 "Destinations": recipients,
